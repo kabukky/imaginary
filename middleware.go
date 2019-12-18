@@ -1,12 +1,14 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/daaku/go.httpgzip"
 	"github.com/rs/cors"
 	"gopkg.in/h2non/bimg.v1"
 	"gopkg.in/throttled/throttled.v2"
@@ -16,20 +18,20 @@ import (
 func Middleware(fn func(http.ResponseWriter, *http.Request), o ServerOptions) http.Handler {
 	next := http.Handler(http.HandlerFunc(fn))
 
+	if len(o.Endpoints) > 0 {
+		next = filterEndpoint(next, o)
+	}
 	if o.Concurrency > 0 {
 		next = throttle(next, o)
-	}
-	if o.Gzip {
-		next = httpgzip.NewHandler(next)
 	}
 	if o.CORS {
 		next = cors.Default().Handler(next)
 	}
-	if o.ApiKey != "" {
+	if o.APIKey != "" {
 		next = authorizeClient(next, o)
 	}
-	if o.HttpCacheTtl >= 0 {
-		next = setCacheHeaders(next, o.HttpCacheTtl)
+	if o.HTTPCacheTTL >= 0 {
+		next = setCacheHeaders(next, o.HTTPCacheTTL)
 	}
 
 	return validate(defaultHeaders(next), o)
@@ -37,8 +39,24 @@ func Middleware(fn func(http.ResponseWriter, *http.Request), o ServerOptions) ht
 
 func ImageMiddleware(o ServerOptions) func(Operation) http.Handler {
 	return func(fn Operation) http.Handler {
-		return validateImage(Middleware(imageController(o, Operation(fn)), o), o)
+		handler := validateImage(Middleware(imageController(o, fn), o), o)
+
+		if o.EnableURLSignature {
+			return validateURLSignature(handler, o)
+		}
+
+		return handler
 	}
+}
+
+func filterEndpoint(next http.Handler, o ServerOptions) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if o.Endpoints.IsValid(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ErrorReply(r, w, ErrNotImplemented, o)
+	})
 }
 
 func throttleError(err error) http.Handler {
@@ -53,7 +71,7 @@ func throttle(next http.Handler, o ServerOptions) http.Handler {
 		return throttleError(err)
 	}
 
-	quota := throttled.RateQuota{throttled.PerSec(o.Concurrency), o.Burst}
+	quota := throttled.RateQuota{MaxRate: throttled.PerSec(o.Concurrency), MaxBurst: o.Burst}
 	rateLimiter, err := throttled.NewGCRARateLimiter(store, quota)
 	if err != nil {
 		return throttleError(err)
@@ -69,7 +87,7 @@ func throttle(next http.Handler, o ServerOptions) http.Handler {
 
 func validate(next http.Handler, o ServerOptions) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" && r.Method != "POST" {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			ErrorReply(r, w, ErrMethodNotAllowed, o)
 			return
 		}
@@ -81,12 +99,12 @@ func validate(next http.Handler, o ServerOptions) http.Handler {
 func validateImage(next http.Handler, o ServerOptions) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if r.Method == "GET" && isPublicPath(path) {
+		if r.Method == http.MethodGet && isPublicPath(path) {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		if r.Method == "GET" && o.Mount == "" && o.EnableURLSource == false {
+		if r.Method == http.MethodGet && o.Mount == "" && !o.EnableURLSource {
 			ErrorReply(r, w, ErrMethodNotAllowed, o)
 			return
 		}
@@ -102,8 +120,8 @@ func authorizeClient(next http.Handler, o ServerOptions) http.Handler {
 			key = r.URL.Query().Get("key")
 		}
 
-		if key != o.ApiKey {
-			ErrorReply(r, w, ErrInvalidApiKey, o)
+		if key != o.APIKey {
+			ErrorReply(r, w, ErrInvalidAPIKey, o)
 			return
 		}
 
@@ -122,7 +140,7 @@ func setCacheHeaders(next http.Handler, ttl int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer next.ServeHTTP(w, r)
 
-		if r.Method != "GET" || isPublicPath(r.URL.Path) {
+		if r.Method != http.MethodGet || isPublicPath(r.URL.Path) {
 			return
 		}
 
@@ -143,4 +161,32 @@ func getCacheControl(ttl int) string {
 
 func isPublicPath(path string) bool {
 	return path == "/" || path == "/health" || path == "/form"
+}
+
+func validateURLSignature(next http.Handler, o ServerOptions) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Retrieve and remove URL signature from request parameters
+		query := r.URL.Query()
+		sign := query.Get("sign")
+		query.Del("sign")
+
+		// Compute expected URL signature
+		h := hmac.New(sha256.New, []byte(o.URLSignatureKey))
+		h.Write([]byte(r.URL.Path))
+		h.Write([]byte(query.Encode()))
+		expectedSign := h.Sum(nil)
+
+		urlSign, err := base64.RawURLEncoding.DecodeString(sign)
+		if err != nil {
+			ErrorReply(r, w, ErrInvalidURLSignature, o)
+			return
+		}
+
+		if !hmac.Equal(urlSign, expectedSign) {
+			ErrorReply(r, w, ErrURLSignatureMismatch, o)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }

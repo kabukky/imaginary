@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -52,6 +53,10 @@ func TestCrop(t *testing.T) {
 		t.Fatalf("Invalid response status: %s", res.Status)
 	}
 
+	if res.Header.Get("Content-Length") == "" {
+		t.Fatal("Empty content length response")
+	}
+
 	image, err := ioutil.ReadAll(res.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +78,7 @@ func TestCrop(t *testing.T) {
 func TestResize(t *testing.T) {
 	ts := testServer(controller(Resize))
 	buf := readFile("large.jpg")
-	url := ts.URL + "?width=300"
+	url := ts.URL + "?width=300&nocrop=false"
 	defer ts.Close()
 
 	res, err := http.Post(url, "image/jpeg", buf)
@@ -169,13 +174,112 @@ func TestExtract(t *testing.T) {
 	}
 }
 
+func TestTypeAuto(t *testing.T) {
+	cases := []struct {
+		acceptHeader string
+		expected     string
+	}{
+		{"", "jpeg"},
+		{"image/webp,*/*", "webp"},
+		{"image/png,*/*", "png"},
+		{"image/webp;q=0.8,image/jpeg", "webp"},
+		{"text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8", "webp"}, // Chrome
+	}
+
+	for _, test := range cases {
+		ts := testServer(controller(Crop))
+		buf := readFile("large.jpg")
+		url := ts.URL + "?width=300&type=auto"
+		defer ts.Close()
+
+		req, _ := http.NewRequest(http.MethodPost, url, buf)
+		req.Header.Add("Content-Type", "image/jpeg")
+		req.Header.Add("Accept", test.acceptHeader)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal("Cannot perform the request")
+		}
+
+		if res.StatusCode != 200 {
+			t.Fatalf("Invalid response status: %s", res.Status)
+		}
+
+		if res.Header.Get("Content-Length") == "" {
+			t.Fatal("Empty content length response")
+		}
+
+		image, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(image) == 0 {
+			t.Fatalf("Empty response body")
+		}
+
+		err = assertSize(image, 300, 1080)
+		if err != nil {
+			t.Error(err)
+		}
+
+		if bimg.DetermineImageTypeName(image) != test.expected {
+			t.Fatalf("Invalid image type")
+		}
+
+		if res.Header.Get("Vary") != "Accept" {
+			t.Fatal("Vary header not set correctly")
+		}
+	}
+}
+
+func TestFit(t *testing.T) {
+	var err error
+
+	buf := readFile("large.jpg")
+	original, _ := ioutil.ReadAll(buf)
+	err = assertSize(original, 1920, 1080)
+	if err != nil {
+		t.Errorf("Reference image expecations weren't met")
+	}
+
+	ts := testServer(controller(Fit))
+	url := ts.URL + "?width=300&height=300"
+	defer ts.Close()
+
+	res, err := http.Post(url, "image/jpeg", bytes.NewReader(original))
+	if err != nil {
+		t.Fatal("Cannot perform the request")
+	}
+
+	if res.StatusCode != 200 {
+		t.Fatalf("Invalid response status: %s", res.Status)
+	}
+
+	image, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(image) == 0 {
+		t.Fatalf("Empty response body")
+	}
+
+	// The reference image has a ratio of 1.778, this should produce a height of 168.75
+	err = assertSize(image, 300, 169)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if bimg.DetermineImageTypeName(image) != "jpeg" {
+		t.Fatalf("Invalid image type")
+	}
+}
+
 func TestRemoteHTTPSource(t *testing.T) {
 	opts := ServerOptions{EnableURLSource: true}
 	fn := ImageMiddleware(opts)(Crop)
 	LoadSources(opts)
 
 	tsImage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		buf, _ := ioutil.ReadFile("fixtures/large.jpg")
+		buf, _ := ioutil.ReadFile("testdata/large.jpg")
 		w.Write(buf)
 	}))
 	defer tsImage.Close()
@@ -234,7 +338,7 @@ func TestInvalidRemoteHTTPSource(t *testing.T) {
 }
 
 func TestMountDirectory(t *testing.T) {
-	opts := ServerOptions{Mount: "fixtures"}
+	opts := ServerOptions{Mount: "testdata"}
 	fn := ImageMiddleware(opts)(Crop)
 	LoadSources(opts)
 
@@ -312,7 +416,7 @@ func testServer(fn func(w http.ResponseWriter, r *http.Request)) *httptest.Serve
 }
 
 func readFile(file string) io.Reader {
-	buf, _ := os.Open(path.Join("fixtures", file))
+	buf, _ := os.Open(path.Join("testdata", file))
 	return buf
 }
 
@@ -322,7 +426,7 @@ func assertSize(buf []byte, width, height int) error {
 		return err
 	}
 	if size.Width != width || size.Height != height {
-		return fmt.Errorf("Invalid image size: %dx%d", size.Width, size.Height)
+		return fmt.Errorf("Invalid image size: %dx%d, expected: %dx%d", size.Width, size.Height, width, height)
 	}
 	return nil
 }

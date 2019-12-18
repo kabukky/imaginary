@@ -10,7 +10,7 @@ import (
 
 const formatPattern = "%s - - [%s] \"%s\" %d %d %.4f\n"
 
-// LogRecords implements a Apache-compatible HTTP logging
+// LogRecord implements an Apache-compatible HTTP logging
 type LogRecord struct {
 	http.ResponseWriter
 	status                int
@@ -23,7 +23,7 @@ type LogRecord struct {
 
 // Log writes a log entry in the passed io.Writer stream
 func (r *LogRecord) Log(out io.Writer) {
-	timeFormat := r.time.Format("02/Jan/2006 03:04:05")
+	timeFormat := r.time.Format("02/Jan/2006 15:04:05")
 	request := fmt.Sprintf("%s %s %s", r.method, r.uri, r.protocol)
 	fmt.Fprintf(out, formatPattern, r.ip, timeFormat, request, r.status, r.responseBytes, r.elapsedTime.Seconds())
 }
@@ -36,7 +36,7 @@ func (r *LogRecord) Write(p []byte) (int, error) {
 	return written, err
 }
 
-// WriteHeader
+// WriteHeader calls ResponseWriter.WriteHeader() and sets the status code
 func (r *LogRecord) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
@@ -48,12 +48,12 @@ type LogHandler struct {
 	io      io.Writer
 }
 
-// Creates a new logger
+// NewLog creates a new logger
 func NewLog(handler http.Handler, io io.Writer) http.Handler {
 	return &LogHandler{handler, io}
 }
 
-// Implementes the required method as standard HTTP handler, serving the request.
+// Implements the required method as standard HTTP handler, serving the request.
 func (h *LogHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIP := r.RemoteAddr
 	if colon := strings.LastIndex(clientIP, ":"); colon != -1 {
